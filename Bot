@@ -1,0 +1,272 @@
+import random
+import logging
+import json
+from datetime import datetime, timedelta
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, ContextTypes,
+    MessageHandler, filters, JobQueue
+)
+
+# === CONFIG ===
+BOT_TOKEN = "8007679799:AAGekKeFh9L9oWLI35ieOM3ENjCxCKofJow"
+ADMIN_CHAT_ID = "-4618714192"  # Chat ID where you want logs
+PARTICIPANT_FILE = "participan.json"  # Stores unique participant numbers
+
+# === STATE ===
+participants = {}  # chat_id -> data
+
+# === UTILS ===
+def load_participants():
+    try:
+        with open(PARTICIPANT_FILE, "r") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+def save_participants(data):
+    with open(PARTICIPANT_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+# Generate a unique participant ID
+def generate_unique_number(existing_ids):
+    while True:
+        number = f"P{random.randint(1000, 9999)}"
+        if number not in existing_ids:
+            return number
+
+# === START COMMAND ===
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    participants_data = load_participants()
+
+    if str(chat_id) in participants_data:
+        await context.bot.send_message(chat_id=chat_id, text="Ви вже зареєстровані!")
+        return
+
+    new_id = generate_unique_number([p["id"] for p in participants_data.values()])
+    participants_data[str(chat_id)] = {
+        "id": new_id,
+        "joined_at": datetime.now().isoformat(),
+        "task_done": False,
+        "second_task_done": False  # Track second task status
+    }
+    save_participants(participants_data)
+
+    await context.bot.send_message(chat_id=chat_id, text=f"Привіт! Ваш анонімний номер учасника: {new_id}")
+
+    # Notify admin
+    await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"✅ Учасник {new_id} приєднався.")
+
+    # Schedule test message and task reminder
+    context.job_queue.run_once(send_test_message, when=5, chat_id=chat_id)  # 5 seconds for test message
+    context.job_queue.run_once(ask_if_done, when=20, chat_id=chat_id)  # 20 seconds for task reminder
+
+# === SEND TEST MESSAGE ===
+async def send_test_message(context: ContextTypes.DEFAULT_TYPE):
+    chat_id = context.job.chat_id
+    await context.bot.send_message(chat_id=chat_id, text="""\
+Вітаю! Дякую за участь у цьому дослідженні!
+
+На цій сторінці Ви зможете прочитати короткий опис дослідження та те, що потрібно виконати перш ніж переходити до самого завдання.
+
+У цьому дослідженні Вам буде потрібно писати на одну із заданих тем 15 хвилин та заповнити анкету до і після експерименту. Усі дані будуть конфіденційними, а Ваші записи будуть доступні лише Вам.
+
+Перед виконанням завдань, будь ласка:
+• Заповніть це опитування (https://docs.google.com/forms/d/e/1FAIpQLSdqW48eEaLW27ax2iQ-NfXQ2VT1Uw-7cNlPzVeqEfH5Lgcetg/viewform?usp=header)
+• Зверніть увагу, що ця техніка може бути досить емоційною, і деякі люди плакали під час її виконання
+• Краще мати ці інструкції під рукою під час експерименту.
+
+ВАЖЛИВО: будь ласка, не обговорюйте ні з ким письмову техніку та деталі своїх інструкцій.
+""")
+
+# === ASK IF DONE ===
+async def ask_if_done(context: ContextTypes.DEFAULT_TYPE):
+    chat_id = context.job.chat_id
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="Чи виконали ви перше опитування? (Відповідайте: так / ні)"
+    )
+
+# === HANDLE TEXT REPLIES ("так"/"ні") ===
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.lower()
+    chat_id = update.effective_chat.id
+    participants_data = load_participants()
+    user = participants_data.get(str(chat_id), None)
+
+    if not user:
+        return
+
+    # Check for task completion phrases
+    task_numbers = {
+        "один": 1, "перше": 1, "1": 1,
+        "два": 2, "друге": 2, "2": 2,
+        "три": 3, "третє": 3, "3": 3,
+        "чотири": 4, "четверте": 4, "4": 4
+    }
+
+    if any(phrase in text.lower() for phrase in ["виконала завдання", "виконав завдання"]):
+        for word, task_num in task_numbers.items():
+            if word in text.lower():
+                join_date = datetime.fromisoformat(user['joined_at'])
+                is_new_user = (datetime.now() - join_date).days <= 1
+
+                # Notify admin about task completion
+                await context.bot.send_message(
+                    chat_id=ADMIN_CHAT_ID, 
+                    text=f"✅ Учасник {user['id']} виконав завдання {task_num}"
+                )
+
+                # Send group-specific completion message only for the first task
+                if task_num == 1:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text="Дякую за виконання сьогоднішнього завдання! Завтра Вам буде надіслано наступні інструкції. До зустрічі!"
+                    )
+
+                # Handle task scheduling for new users after the fourth task
+                if task_num == 4 and is_new_user:
+                    context.job_queue.run_once(
+                        send_second_questionnaire,
+                        when=timedelta(days=14),
+                        chat_id=chat_id
+                    )
+
+                save_participants(participants_data)
+                return
+
+    # Handle answer "так" for first task completion
+    if "так" in text:
+        if user.get("task_done") is False:
+            user["task_done"] = True
+
+            # Check if user is new
+            join_date = datetime.fromisoformat(user['joined_at'])
+            is_new_user = (datetime.now() - join_date).days <= 1
+
+            await context.bot.send_message(
+                chat_id=ADMIN_CHAT_ID,
+                text=f"✅ Учасник {user['id']} повідомив про виконання завдання"
+            )
+
+            # Randomly assign to group A or B and send corresponding messages
+            if is_new_user:
+                group = random.choice(['A', 'B'])
+                user['group'] = group
+
+                # Send initial instructions
+                prep_text = """Знайдіть тихе місце, де Вас ніхто не потурбує протягом 15-30 хвилин. Підготуйте папір і ручку, або ваш планшет чи ноутбук (якщо використовуєте електронні пристрої, увімкніть авіарежим, щоб уникнути відволікань).
+• Поставте таймер на 15 хвилин. Якщо вважаєте за потрібне, Ви можете продовжувати писати і після дзвінка таймера.
+• Коли почнете писати, не зупиняйтеся, хіба що Вам буде зовсім важко емоційно."""
+
+                await context.bot.send_message(chat_id=chat_id, text=prep_text)
+
+                # Send group-specific instructions
+                task_text = """Оберіть одну із запропонованих тем та починайте писати, не відволікаючись.
+                • Детально опишіть, що ви зробили з того часу, як прокинулися сьогодні вранці.
+                • Детально опишіть ваші плани на сьогоднішній день. 
+                • Детально опишіть останню подію або захід, які ви відвідували. 
+                • Детально опишіть будь-який предмет, який ви бачите навколо себе чи гарно відому вам будівлю. 
+                • Детально розпишіть як приготувати каву з нуля
+                Важливо, щоб ви описували події саме так, як вони відбувалися. Не згадуйте власні емоції, почуття чи думки. Намагайтеся бути максимально об’єктивними.
+                Після того, як почали писати, не зупиняйтеся. Не зважайте на помилки, грамотність, чи сюжет історій. Якщо закінчилися нові ідеї, просто повторюйте те, що вже написали. Пишіть повними реченнями, навіть якщо вони не ідеальні. Ніхто, крім вас, не читатиме цього."""
+                await context.bot.send_message(chat_id=chat_id, text=task_text)
+
+                # Closing message
+                closing_text = """Закрийте зошит чи документ, в якому писали, і відкладіть його. Якщо треба, можна кілька хвилин посидіти, щоб заспокоїтися. Якщо вам сумно, це нормально, зазвичай це минає за кілька годин, як після перегляду сумного фільму."""
+
+                await context.bot.send_message(chat_id=chat_id, text=closing_text)
+
+            else:
+                await context.bot.send_message(chat_id=chat_id, text="Чудово! Очікуйте інші учасників.")
+
+        save_participants(participants_data)
+
+    elif "ні" in text:
+        if user.get("task_done") is False:
+            await context.bot.send_message(chat_id=chat_id, text="Будь ласка, поверніться до гугл форми та заповніть її.")
+            context.job_queue.run_once(ask_if_done, when=40, chat_id=chat_id)  # Ask again after 40 seconds
+
+
+# === MANUAL TASK ASSIGNMENT ===
+async def assign(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text("Використання: /assign P1234 текст_повідомлення")
+        return
+
+    participant_id = args[0]
+    message_text = " ".join(args[1:])
+
+    participants_data = load_participants()
+    for chat_id, data in participants_data.items():
+        if data["id"] == participant_id:
+            await context.bot.send_message(chat_id=int(chat_id), text=message_text)
+            await update.message.reply_text(f"✅ Повідомлення надіслано до {participant_id}")
+            return
+
+    await update.message.reply_text("❌ Учасник не знайдений.")
+
+# === REMOVE YOURSELF ===
+async def clear_me(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id  # Get the chat ID of the user
+    participants_data = load_participants()  # Load the participants data
+
+    # Check if the user is in the participants list
+    if str(chat_id) in participants_data:
+        del participants_data[str(chat_id)]  # Remove the participant
+        save_participants(participants_data)  # Save the updated data back to the file
+        await update.message.reply_text("✅ Ви були видалені з реєстрації.")
+    else:
+        await update.message.reply_text("❌ Ви не зареєстровані у системі.")
+
+# === BROADCAST TO MULTIPLE USERS ===
+async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if str(update.effective_chat.id) != ADMIN_CHAT_ID:
+        return  # Only admin can broadcast
+    
+    if len(context.args) < 2:
+        await update.message.reply_text("Використання: /broadcast P1234,P5678 текст_повідомлення")
+        return
+
+    # First argument is comma-separated list of participant IDs
+    participant_ids = context.args[0].split(',')
+    message_text = " ".join(context.args[1:])
+    
+    participants_data = load_participants()
+    delivery_status = {}
+    
+    # Send messages and track status for each participant
+    for chat_id, data in participants_data.items():
+        if data["id"] in participant_ids:
+            try:
+                await context.bot.send_message(chat_id=int(chat_id), text=message_text)
+                delivery_status[data["id"]] = "✅ Доставлено"
+            except Exception as e:
+                delivery_status[data["id"]] = f"❌ Помилка: {str(e)}"
+    
+    # Create detailed report
+    status_report = "📬 Статус доставки:\n\n"
+    for p_id in participant_ids:
+        status = delivery_status.get(p_id, "❌ Учасника не знайдено в системі")
+        status_report += f"{p_id}: {status}\n"
+    
+    await update.message.reply_text(status_report)
+
+# === BOT APP ===
+def main():
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    # Add handlers
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("assign", assign))  # The assign command
+    app.add_handler(CommandHandler("clearme", clear_me))  # Add the clear_me handler
+    app.add_handler(CommandHandler("broadcast", broadcast))  # Add the broadcast handler
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    print("🤖 Бот запущено!")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
